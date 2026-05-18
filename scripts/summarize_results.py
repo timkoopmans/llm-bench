@@ -102,6 +102,83 @@ def main() -> int:
             f"| {m_wall:>9} "
             f"| {full}/{n:<3} |"
         )
+
+    # Wide table: one row per task, columns per backend.
+    # Pick the most recent row that has a non-null total per (task,label);
+    # fall back to most recent row overall if none have data.
+    by_task = defaultdict(dict)  # task -> label -> chosen row
+    by_task_all = defaultdict(lambda: defaultdict(list))
+    for r in rows:
+        t = r.get("task")
+        l = r.get("label")
+        if not t or not l:
+            continue
+        by_task_all[t][l].append(r)
+    for t, by_label in by_task_all.items():
+        for l, rs in by_label.items():
+            rs.sort(key=lambda r: r.get("ts", ""))
+            chosen = None
+            for r in reversed(rs):
+                if r.get("total") is not None:
+                    chosen = r
+                    break
+            by_task[t][l] = chosen or rs[-1]
+
+    labels_order = ["claude", "blackwell", "3090s"]
+    seen_labels = set()
+    for v in by_task.values():
+        seen_labels.update(v.keys())
+    labels_order = [l for l in labels_order if l in seen_labels] + [
+        l for l in sorted(seen_labels) if l not in labels_order
+    ]
+
+    print(f"\n## Per-task (latest run per backend)\n")
+    header = "| task |" + "".join(f" {l} |" for l in labels_order)
+    sep = "|------|" + "".join("--------|" for _ in labels_order)
+    print(header)
+    print(sep)
+
+    def cell(r):
+        if r is None:
+            return "—"
+        p = r.get("passed")
+        t_ = r.get("total")
+        tps = r.get("tok_s")
+        wall = r.get("wall")
+        if not t_:
+            # No spec data (timeout, no code extracted, pytest collected 0).
+            bits = ["⏱"]
+            if wall:
+                bits.append(f"{wall:.0f}s")
+            return " ".join(bits)
+        spec = f"{p}/{t_}"
+        if p != t_:
+            spec = f"❌ {spec}"
+        bits = [spec]
+        if tps:
+            bits.append(f"{tps:.0f}t/s")
+        if wall:
+            bits.append(f"{wall:.1f}s")
+        return " · ".join(bits)
+
+    totals = {l: [0, 0] for l in labels_order}  # passed, total
+    for t in sorted(by_task.keys()):
+        row = by_task[t]
+        line = f"| {t[:50]} |"
+        for l in labels_order:
+            r = row.get(l)
+            line += f" {cell(r)} |"
+            if r and r.get("total"):
+                totals[l][0] += r["passed"] or 0
+                totals[l][1] += r["total"]
+        print(line)
+
+    # Footer totals row
+    total_line = "| **TOTAL passed** |"
+    for l in labels_order:
+        p, t_ = totals[l]
+        total_line += f" **{p}/{t_}** |" if t_ else " — |"
+    print(total_line)
     return 0
 
 
