@@ -124,13 +124,35 @@ def main() -> int:
             return f"[{t[:50]}]({REPO_URL}/scripts/specs/lcb/{t}.py)"
         return f"[{t[:50]}]({REPO_URL}/scripts/specs/{t}.py)"
 
+    def winner_label(row):
+        """Best label per task: most passed/total ratio, tie-break on faster wall."""
+        ranked = []
+        for l, r in row.items():
+            if not r or not r.get("total"):
+                continue
+            ratio = (r.get("passed") or 0) / r["total"]
+            wall = r.get("wall") or float("inf")
+            ranked.append((ratio, -wall, l))
+        if not ranked:
+            return None
+        ranked.sort(reverse=True)
+        # Only award trophy if winner actually passed something.
+        best_ratio = ranked[0][0]
+        if best_ratio <= 0:
+            return None
+        return ranked[0][2]
+
     totals = {l: [0, 0] for l in labels_order}  # passed, total
     for t in sorted(by_task.keys()):
         row = by_task[t]
+        winner = winner_label(row)
         line = f"| {task_link(t)} |"
         for l in labels_order:
             r = row.get(l)
-            line += f" {cell(r)} |"
+            text = cell(r)
+            if l == winner:
+                text = f"🏆 {text}"
+            line += f" {text} |"
             if r and r.get("total"):
                 totals[l][0] += r["passed"] or 0
                 totals[l][1] += r["total"]
