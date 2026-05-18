@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# Manage Vast.ai vLLM instance serving Qwen3-Coder-30B-FP8.
+# Reads config from ../.env (HF_TOKEN, VAST_INSTANCE_ID, VLLM_*).
+#
+# Usage:
+#   vast-vllm create        # rent + provision new instance (prints ID)
+#   vast-vllm refresh-ports # re-read public IP/ports into .env
+#   vast-vllm fix           # push HF_TOKEN, disable AUTO_PARALLEL, restart vllm
+#   vast-vllm status        # supervisor + GPU + endpoint probe
+#   vast-vllm logs [N]      # tail N lines vllm.log (default 80)
+#   vast-vllm follow        # tail -F vllm.log
+#   vast-vllm test          # curl /v1/models + small chat completion
+#   vast-vllm ssh [cmd...]  # ssh into instance
+#   vast-vllm stop          # stop (keeps disk, weights cached)
+#   vast-vllm start         # start a stopped instance
+#   vast-vllm destroy       # destroy (loses weights)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/../.env"
+[[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+set -a; . "$ENV_FILE"; set +a
+
+OFFER_ID="${VAST_OFFER_ID:-35113355}"
+IMAGE="${VAST_IMAGE:-vastai/vllm:v0.20.1-cuda-13.0}"
+DISK_GB="${VAST_DISK_GB:-120}"
+MODEL="${VLLM_MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8}"
+SERVED_NAME="${VLLM_MODEL_NAME:-qwen-coder}"
+
+need() { command -v "$1" >/dev/null || { echo "need $1" >&2; exit 1; }; }
+need vastai
+need jq
+need ssh
+need curl
+
+iid() { echo "${VAST_INSTANCE_ID:?VAST_INSTANCE_ID not set — run create or refresh-ports}"; }
+ssh_target() { echo "root@${VLLM_HOST:?VLLM_HOST not set}"; }
+ssh_args()   { echo "-o StrictHostKeyChecking=no -o ConnectTimeout=10 -p ${VLLM_SSH_PORT:?VLLM_SSH_PORT not set}"; }
+
+vllm_env_block() {
+  cat <<EOF
+-e HF_TOKEN=${HF_TOKEN:?HF_TOKEN not set}
+-e VLLM_MODEL=${MODEL}
+-e VLLM_ARGS=--kv-cache-dtype turboquant_k8v4 --max-num-seqs 8 --enable-auto-tool-choice --tool-call-parser hermes --max-model-len 131072 --gpu-memory-utilization 0.92 --enable-prefix-caching --served-model-name ${SERVED_NAME} --download-dir /workspace/models --host 0.0.0.0 --port 8000 --tensor-parallel-size 1
+-e AUTO_PARALLEL=false
+-e DATA_DIRECTORY=/workspace/
+-e RAY_ADDRESS=127.0.0.1
+-e RAY_ARGS=--head --port 6379 --dashboard-host 127.0.0.1 --dashboard-port 28265
+-e OPEN_BUTTON_PORT=1111
+-e OPEN_BUTTON_TOKEN=1
+-e JUPYTER_DIR=/
+EOF
+}
+
+cmd_create() {
+  local env_str ports
+  ports='-p 1111:1111 -p 7860:7860 -p 8080:8080 -p 8000:8000 -p 8265:8265'
+  env_str="${ports} $(vllm_env_block | tr '\n' ' ')"
+  echo "creating instance from offer ${OFFER_ID}..."
+  vastai create instance "$OFFER_ID" --image "$IMAGE" --env "$env_str" \
+    --disk "$DISK_GB" --ssh --direct
+  echo "after a minute, run: $0 refresh-ports"
+}
+
+cmd_refresh_ports() {
+  local id raw ip p8000 p22
+  id=$(iid)
+  raw=$(vastai show instance "$id" --raw)
+  ip=$(echo "$raw" | jq -r '.public_ipaddr')
+  p8000=$(echo "$raw" | jq -r '.ports["8000/tcp"][0].HostPort')
+  p22=$(echo "$raw" | jq -r '.ports["22/tcp"][0].HostPort')
+  [[ "$ip" = "null" || -z "$ip" ]] && { echo "no public ip yet" >&2; exit 1; }
+  echo "VLLM_HOST=$ip VLLM_PORT=$p8000 VLLM_SSH_PORT=$p22"
+  # update .env in place
+  for k in VLLM_HOST VLLM_PORT VLLM_SSH_PORT; do
+    case "$k" in
+      VLLM_HOST) v=$ip ;;
+      VLLM_PORT) v=$p8000 ;;
+      VLLM_SSH_PORT) v=$p22 ;;
+    esac
+    if grep -q "^${k}=" "$ENV_FILE"; then
+      # macOS/BSD sed
+      sed -i.bak "s|^${k}=.*|${k}=${v}|" "$ENV_FILE" && rm -f "${ENV_FILE}.bak"
+    else
+      echo "${k}=${v}" >> "$ENV_FILE"
+    fi
+  done
+  echo "$ENV_FILE updated"
+}
+
+cmd_ssh() {
+  # shellcheck disable=SC2086
+  ssh $(ssh_args) "$(ssh_target)" "$@"
+}
+
+cmd_fix() {
+  # idempotent: push HF_TOKEN, force AUTO_PARALLEL=false, ensure -tp 1, restart
+  cmd_ssh "
+    set -e
+    grep -q '^HF_TOKEN=' /etc/environment && sed -i 's|^HF_TOKEN=.*|HF_TOKEN=\"${HF_TOKEN}\"|' /etc/environment || echo 'HF_TOKEN=\"${HF_TOKEN}\"' >> /etc/environment
+    grep -q '^AUTO_PARALLEL=' /etc/environment && sed -i 's|^AUTO_PARALLEL=.*|AUTO_PARALLEL=\"false\"|' /etc/environment || echo 'AUTO_PARALLEL=\"false\"' >> /etc/environment
+    supervisorctl restart vllm
+    supervisorctl status vllm
+  "
+}
+
+cmd_status() {
+  echo "=== endpoint ==="
+  curl -s -m 5 -o /tmp/vllm_probe -w 'HTTP %{http_code} in %{time_total}s\n' \
+    "http://${VLLM_HOST}:${VLLM_PORT}/v1/models" || true
+  [[ -s /tmp/vllm_probe ]] && jq . /tmp/vllm_probe 2>/dev/null || true
+  echo
+  cmd_ssh '
+    echo === supervisor ===
+    supervisorctl status vllm ray
+    echo === gpu ===
+    nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader
+    echo === weights ===
+    du -sh /workspace/models 2>/dev/null
+  '
+}
+
+cmd_logs() {
+  local n="${1:-80}"
+  cmd_ssh "tail -n ${n} /var/log/portal/vllm.log | sed 's/\x1b\[[0-9;]*m//g'"
+}
+
+cmd_follow() {
+  cmd_ssh "tail -F /var/log/portal/vllm.log | sed -u 's/\x1b\[[0-9;]*m//g'"
+}
+
+cmd_test() {
+  local url="http://${VLLM_HOST}:${VLLM_PORT}"
+  echo "=== /v1/models ==="
+  curl -fsS "$url/v1/models" | jq .
+  echo
+  echo "=== chat completion ==="
+  curl -fsS "$url/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg m "$SERVED_NAME" '{
+      model:$m, max_tokens:64, temperature:0,
+      messages:[{role:"user",content:"Reply with the single word PONG."}]
+    }')" | jq .
+}
+
+cmd_stop()    { vastai stop instance "$(iid)"; }
+cmd_start()   { vastai start instance "$(iid)"; echo "after a minute: $0 refresh-ports && $0 fix"; }
+cmd_destroy() { vastai destroy instance "$(iid)"; }
+
+main() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    create)        cmd_create "$@" ;;
+    refresh-ports) cmd_refresh_ports ;;
+    fix)           cmd_fix ;;
+    status)        cmd_status ;;
+    logs)          cmd_logs "$@" ;;
+    follow)        cmd_follow ;;
+    test)          cmd_test ;;
+    ssh)           cmd_ssh "$@" ;;
+    stop)          cmd_stop ;;
+    start)         cmd_start ;;
+    destroy)       cmd_destroy ;;
+    -h|--help|help) sed -n '2,20p' "$0" ;;
+    *) echo "unknown: $sub" >&2; sed -n '2,20p' "$0"; exit 2 ;;
+  esac
+}
+main "$@"

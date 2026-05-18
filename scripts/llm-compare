@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# 3-way iTerm2 comparison: Claude API | Blackwell vast vllm | 3090 idc-1 llama.cpp.
+# Reads ../.env for endpoints + keys. Pane IDs cached in /tmp/llm-compare-panes.
+#
+# Usage:
+#   llm-compare              # if panes exist: rerun in them; else: start fresh
+#   llm-compare start        # force-create new panes (control top + 3 cols bottom)
+#   llm-compare go ["prompt"]# rerun in existing panes (default subcmd)
+#   llm-compare reset        # forget cached pane IDs
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/../.env"
+set -a; . "$ENV_FILE"; set +a
+
+STATE_FILE=/tmp/llm-compare-panes
+STREAM="${SCRIPT_DIR}/llm_stream.py"
+SPEC_FILE="${SPEC_FILE:-${SCRIPT_DIR}/specs/lfucache.py}"
+
+# Single canonical task for repeatable spec comparison.
+# Same prompt every run (cache-busted via nonce in write_prompt).
+# Read canonical spec; prompt asks model to implement it to satisfy.
+SPEC_SRC="$(cat "$SPEC_FILE")"
+DEFAULT_PROMPT="Implement the Python class required by the canonical unittest spec below. Read the module docstring + test method names + assertions to understand the required API and semantics. Output ONLY the class implementation — DO NOT include any tests, do NOT add 'if __name__' main block, do NOT redefine anything from the spec. Your code will be concatenated above the spec and the spec will be executed.
+
+\`\`\`python
+${SPEC_SRC}
+\`\`\`
+
+CRITICAL: Every test in the spec MUST pass. Mentally walk through each test against your implementation before finalising. Handle every edge case the tests cover (capacity=0, ties, frequency bookkeeping, etc.). The score is N_passed / N_total — anything less than full is a failure."
+
+if [[ "${EXPAND:-0}" == "1" ]]; then
+  GUIDE_FILE=$("${SCRIPT_DIR}/expand_prompt.py" "$SPEC_FILE") || { echo "expand_prompt.py failed" >&2; exit 1; }
+  GUIDE_SRC="$(cat "$GUIDE_FILE")"
+  DEFAULT_PROMPT="${DEFAULT_PROMPT}
+
+--- IMPLEMENTATION GUIDE (senior engineer's notes; follow these) ---
+${GUIDE_SRC}
+--- END GUIDE ---"
+  echo "expanded with: $GUIDE_FILE"
+fi
+
+CLAUDE_MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
+IDC_HOST="${LLM_HOST:-idc-1}"
+IDC_PORT="${LLM_PORT:-8001}"
+IDC_MODEL="${LLM_MODEL_NAME:-unsloth/Qwen3.6-35B-A3B}"
+VAST_HOST="${VLLM_HOST:?VLLM_HOST not set}"
+VAST_PORT="${VLLM_PORT:?VLLM_PORT not set}"
+VAST_MODEL="${VLLM_MODEL_NAME:-qwen-coder}"
+: "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY not set}"
+
+MAX_TOKENS="${MAX_TOKENS:-8192}"
+COUNTDOWN="${COUNTDOWN:-5}"
+RUNNER="${RUNNER:-${SCRIPT_DIR}/../.venv/bin/python3}"
+[[ -x "$RUNNER" ]] || RUNNER="python3"
+
+build_cmds() {
+  local p="$1"
+  local CLAUDE_SPEC="Anthropic API (hosted)"
+  local VAST_SPEC="1x RTX PRO 6000 Blackwell SE, 96GB, vLLM FP8 ctx 131072"
+  local IDC_SPEC="2x RTX 3090, 48GB total, llama.cpp GGUF"
+  CLAUDE_CMD="python3 '${STREAM}' --backend anthropic --label claude --url https://api.anthropic.com/v1 --model '${CLAUDE_MODEL}' --prompt-file '${p}' --api-key '${ANTHROPIC_API_KEY}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${CLAUDE_SPEC}' --spec-file '${SPEC_FILE}'"
+  VAST_CMD="python3 '${STREAM}' --label blackwell --url http://${VAST_HOST}:${VAST_PORT}/v1 --model '${VAST_MODEL}' --prompt-file '${p}' --api-key '${VLLM_API_KEY:-EMPTY}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${VAST_SPEC}' --spec-file '${SPEC_FILE}'"
+  IDC_CMD="python3 '${STREAM}' --label 3090s --url http://${IDC_HOST}:${IDC_PORT}/v1 --model '${IDC_MODEL}' --prompt-file '${p}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${IDC_SPEC}' --spec-file '${SPEC_FILE}'"
+}
+
+write_prompt() {
+  # Append a unique nonce line so every run has a fresh prompt prefix → no
+  # prefix-cache / ephemeral-cache hit on vllm or Anthropic.
+  local nonce p
+  nonce="$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')-$(date +%s%N)"
+  p=$(mktemp -t llm_prompt.XXXXXX)
+  { printf '%s\n\n# nonce: %s\n' "$1" "$nonce"; } > "$p"
+  echo "$p"
+}
+
+cmd_start() {
+  local prompt="$1" pfile
+  pfile=$(write_prompt "$prompt")
+  build_cmds "$pfile"
+  # Capture session IDs as panes are created; print on stdout.
+  local ids
+  ids=$(/usr/bin/osascript <<APPLESCRIPT
+tell application "iTerm2"
+    tell current window
+        tell current session
+            set leftBottom to (split horizontally with default profile)
+        end tell
+        tell leftBottom
+            set midBottom to (split vertically with default profile)
+            write text "clear; ${CLAUDE_CMD//\"/\\\"}"
+            tell midBottom
+                set rightBottom to (split vertically with default profile)
+                write text "clear; ${VAST_CMD//\"/\\\"}"
+                tell rightBottom
+                    write text "clear; ${IDC_CMD//\"/\\\"}"
+                end tell
+            end tell
+        end tell
+        return (unique id of leftBottom) & "|" & (unique id of midBottom) & "|" & (unique id of rightBottom)
+    end tell
+end tell
+APPLESCRIPT
+)
+  echo "$ids" > "$STATE_FILE"
+  echo "panes started + cached → $STATE_FILE"
+  echo "prompt: $pfile"
+}
+
+cmd_go() {
+  local prompt="$1" pfile
+  [[ -s "$STATE_FILE" ]] || { echo "no cached panes; run: $0 start" >&2; exit 1; }
+  IFS='|' read -r CL_ID VA_ID ID_ID < "$STATE_FILE"
+  pfile=$(write_prompt "$prompt")
+  build_cmds "$pfile"
+  /usr/bin/osascript <<APPLESCRIPT || { echo "panes lost — run: $0 start" >&2; rm -f "$STATE_FILE"; exit 1; }
+tell application "iTerm2"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if unique id of s is "${CL_ID}" then
+                    tell s to write text "clear; ${CLAUDE_CMD//\"/\\\"}"
+                else if unique id of s is "${VA_ID}" then
+                    tell s to write text "clear; ${VAST_CMD//\"/\\\"}"
+                else if unique id of s is "${ID_ID}" then
+                    tell s to write text "clear; ${IDC_CMD//\"/\\\"}"
+                end if
+            end repeat
+        end repeat
+    end repeat
+end tell
+APPLESCRIPT
+  echo "go fired in cached panes | prompt: $pfile"
+}
+
+pick_random_lcb_spec() {
+  local dir="${SCRIPT_DIR}/specs/lcb"
+  local files=("${dir}"/p*.py)
+  [[ -e "${files[0]}" ]] || { echo "no LCB specs in ${dir}; run: ${SCRIPT_DIR}/fetch_lcb.py" >&2; exit 1; }
+  local pick="${files[RANDOM % ${#files[@]}]}"
+  SPEC_FILE="$pick"
+  SPEC_SRC="$(cat "$SPEC_FILE")"
+  DEFAULT_PROMPT="Implement the Python class required by the canonical unittest spec below. Read the docstring + test method names + assertions to understand the API. Output ONLY the implementation — DO NOT include any tests, do NOT add 'if __name__' main block, do NOT redefine anything from the spec. Your code will be concatenated above the spec and executed.
+
+\`\`\`python
+${SPEC_SRC}
+\`\`\`
+
+CRITICAL: Every test in the spec MUST pass. Walk through each test against your implementation before finalising. Handle every edge case the tests cover."
+  echo "lcb spec: $(basename "$SPEC_FILE")"
+}
+
+main() {
+  local sub="${1:-auto}"; shift || true
+  local prompt
+  case "$sub" in
+    start)
+      prompt="${1:-$DEFAULT_PROMPT}"
+      cmd_start "$prompt" ;;
+    lcb)
+      pick_random_lcb_spec
+      if [[ -s "$STATE_FILE" ]]; then cmd_go "$DEFAULT_PROMPT"; else cmd_start "$DEFAULT_PROMPT"; fi ;;
+    go)
+      prompt="${1:-$DEFAULT_PROMPT}"
+      cmd_go "$prompt" ;;
+    reset)
+      rm -f "$STATE_FILE"; echo "state cleared" ;;
+    auto)
+      prompt="$DEFAULT_PROMPT"
+      if [[ -s "$STATE_FILE" ]]; then cmd_go "$prompt"; else cmd_start "$prompt"; fi ;;
+    -h|--help|help)
+      sed -n '2,12p' "$0" ;;
+    *)
+      prompt="$sub"
+      if [[ -s "$STATE_FILE" ]]; then cmd_go "$prompt"; else cmd_start "$prompt"; fi ;;
+  esac
+}
+main "$@"

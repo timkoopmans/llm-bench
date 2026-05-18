@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# 3-way refactor benchmark: each backend gets its own git worktree of
+# the target repo, refactors the listed files, then pytest runs the
+# matching test selector. Pass count is reported per backend.
+#
+# Usage:
+#   refactor-compare start          # create worktrees + spawn 3 panes + run
+#   refactor-compare go             # rerun in cached panes (new worktrees)
+#   refactor-compare reset          # forget cached panes + nuke worktrees
+#
+# Config:
+#   CORE_REPO    absolute path to the target git repo (must have .venv with pytest)
+#   TARGETS_REL  space-separated relative file paths to rewrite
+#   TEST_SELECT  pytest -k selector identifying tests covering TARGETS_REL
+#   TEST_PATH    pytest path (file or directory) to run
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/../.env"
+set -a; . "$ENV_FILE"; set +a
+
+CORE_REPO="${CORE_REPO:?CORE_REPO not set (point to a git repo with a working pytest)}"
+CORE_VENV_PY="${CORE_REPO}/.venv/bin/python3"
+CORE_PYTEST="${CORE_REPO}/.venv/bin/pytest"
+# Multi-file refactor: list of primitive files (space-separated relative paths).
+TARGETS_REL_DEFAULT=""
+TARGETS_REL="${TARGETS_REL:?TARGETS_REL not set (space-separated relative file paths)}"
+TEST_PATH="${TEST_PATH:?TEST_PATH not set}"
+TEST_SELECT="${TEST_SELECT:?TEST_SELECT not set}"
+
+STATE_FILE=/tmp/refactor-compare-panes
+STREAM="${SCRIPT_DIR}/llm_stream.py"
+MAX_TOKENS="${MAX_TOKENS:-8192}"
+COUNTDOWN="${COUNTDOWN:-5}"
+
+CLAUDE_MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
+IDC_HOST="${LLM_HOST:-idc-1}"
+IDC_PORT="${LLM_PORT:-8001}"
+IDC_MODEL="${LLM_MODEL_NAME:-qwen-coder}"
+VAST_HOST="${VLLM_HOST:?VLLM_HOST not set}"
+VAST_PORT="${VLLM_PORT:?VLLM_PORT not set}"
+VAST_MODEL="${VLLM_MODEL_NAME:-qwen-coder}"
+: "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY not set}"
+
+[[ -f "$CORE_PYTEST" ]] || { echo "pytest not found: $CORE_PYTEST" >&2; exit 1; }
+
+worktree_dir() { echo "/tmp/llm-bench-$1"; }
+
+ensure_worktree() {
+  local label="$1" wt
+  wt="$(worktree_dir "$label")"
+  if [[ -d "$wt/.git" || -f "$wt/.git" ]]; then
+    git -C "$CORE_REPO" worktree remove --force "$wt" 2>/dev/null || true
+  fi
+  rm -rf "$wt"
+  git -C "$CORE_REPO" worktree add -q --detach "$wt" HEAD
+  echo "$wt"
+}
+
+build_prompt() {
+  # Bundle every file in TARGETS_REL into one multi-file prompt.
+  local goal nonce
+  goal="Refactor the following Python modules from the target Python project for clarity and to remove duplication across them. Behaviour MUST remain identical — an existing pytest suite (~148 tests) will run against your output. Keep the public API of every class (class names, __init__ signatures, inputs/outputs tuples, output column names produced by __call__) byte-identical. You MAY introduce shared private helpers in any of the files (or duplicate a helper) but you may NOT add new files or rename anything public."
+  nonce="$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')-$(date +%s%N)"
+  {
+    printf '%s\n\n' "$goal"
+    printf 'OUTPUT FORMAT (strict):\n'
+    printf 'For EACH file you rewrite, output a line of the form:\n'
+    printf '  # === FILE: <relative-path> ===\n'
+    printf 'followed by the complete rewritten file content (you may wrap it in ```python ... ``` if you like; the wrapper is stripped). Output ONLY rewritten files in that format. No prose, no diff, no explanations.\n\n'
+    printf 'FILES TO REFACTOR (must rewrite all of them):\n'
+    for rel in $TARGETS_REL; do
+      printf '\n# === FILE: %s ===\n```python\n' "$rel"
+      cat "${CORE_REPO}/${rel}"
+      printf '\n```\n'
+    done
+    printf '\n# nonce: %s\n' "$nonce"
+  }
+}
+
+build_cmds() {
+  local pfile="$1"
+  local CLAUDE_SPEC="Anthropic API (hosted)"
+  local VAST_SPEC="1x RTX PRO 6000 Blackwell SE, 96GB, vLLM FP8"
+  local IDC_SPEC="2x RTX 3090, 48GB total, llama.cpp Q5_K_M"
+
+  local wt_claude wt_vast wt_idc
+  wt_claude="$(worktree_dir claude)"
+  wt_vast="$(worktree_dir blackwell)"
+  wt_idc="$(worktree_dir 3090s)"
+
+  local APPLY="${SCRIPT_DIR}/refactor_apply.py"
+  # test-cmd runs refactor_apply: split dump into files inside worktree, then pytest.
+  local CMD_TPL="${CORE_VENV_PY} ${APPLY} {WT} {WT}/REFACTOR_DUMP.txt ${CORE_PYTEST} ${TEST_PATH} -k '${TEST_SELECT}' -q --no-header --color=no --tb=line"
+  local apply_claude="${CMD_TPL//\{WT\}/${wt_claude}}"
+  local apply_vast="${CMD_TPL//\{WT\}/${wt_vast}}"
+  local apply_idc="${CMD_TPL//\{WT\}/${wt_idc}}"
+
+  CLAUDE_CMD="python3 '${STREAM}' --backend anthropic --label claude --url https://api.anthropic.com/v1 --model '${CLAUDE_MODEL}' --prompt-file '${pfile}' --api-key '${ANTHROPIC_API_KEY}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --spec '${CLAUDE_SPEC}' --write-file '${wt_claude}/REFACTOR_DUMP.txt' --write-raw --test-cmd \"${apply_claude}\""
+  VAST_CMD="python3 '${STREAM}' --label blackwell --url http://${VAST_HOST}:${VAST_PORT}/v1 --model '${VAST_MODEL}' --prompt-file '${pfile}' --api-key '${VLLM_API_KEY:-EMPTY}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --spec '${VAST_SPEC}' --write-file '${wt_vast}/REFACTOR_DUMP.txt' --write-raw --test-cmd \"${apply_vast}\""
+  IDC_CMD="python3 '${STREAM}' --label 3090s --url http://${IDC_HOST}:${IDC_PORT}/v1 --model '${IDC_MODEL}' --prompt-file '${pfile}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --spec '${IDC_SPEC}' --write-file '${wt_idc}/REFACTOR_DUMP.txt' --write-raw --test-cmd \"${apply_idc}\""
+}
+
+setup_all_worktrees() {
+  echo "creating worktrees..."
+  ensure_worktree claude    >/dev/null
+  ensure_worktree blackwell >/dev/null
+  ensure_worktree 3090s     >/dev/null
+  echo "worktrees ready:"
+  for l in claude blackwell 3090s; do echo "  $(worktree_dir "$l")"; done
+}
+
+write_prompt_file() {
+  local p
+  p=$(mktemp -t refactor_prompt.XXXXXX)
+  build_prompt > "$p"
+  echo "$p"
+}
+
+write_cmd_script() {
+  # Write a single-line bash command to a temp script the pane just `bash`-runs.
+  # Sidesteps AppleScript quote-escaping.
+  local label="$1" cmd="$2" p
+  p="/tmp/refactor_cmd_${label}.sh"
+  printf '#!/usr/bin/env bash\nclear\n%s\n' "$cmd" > "$p"
+  chmod +x "$p"
+  echo "$p"
+}
+
+cmd_start() {
+  setup_all_worktrees
+  local pfile
+  pfile=$(write_prompt_file)
+  build_cmds "$pfile"
+  local s_claude s_vast s_idc
+  s_claude=$(write_cmd_script claude    "$CLAUDE_CMD")
+  s_vast=$(  write_cmd_script blackwell "$VAST_CMD")
+  s_idc=$(   write_cmd_script 3090s     "$IDC_CMD")
+  local ids
+  ids=$(/usr/bin/osascript <<APPLESCRIPT
+tell application "iTerm2"
+    tell current window
+        tell current session
+            set leftBottom to (split horizontally with default profile)
+        end tell
+        tell leftBottom
+            set midBottom to (split vertically with default profile)
+            write text "bash ${s_claude}"
+            tell midBottom
+                set rightBottom to (split vertically with default profile)
+                write text "bash ${s_vast}"
+                tell rightBottom
+                    write text "bash ${s_idc}"
+                end tell
+            end tell
+        end tell
+        return (unique id of leftBottom) & "|" & (unique id of midBottom) & "|" & (unique id of rightBottom)
+    end tell
+end tell
+APPLESCRIPT
+)
+  echo "$ids" > "$STATE_FILE"
+  echo "panes started → $STATE_FILE | prompt: $pfile"
+}
+
+cmd_go() {
+  [[ -s "$STATE_FILE" ]] || { echo "no cached panes; run: $0 start" >&2; exit 1; }
+  setup_all_worktrees
+  IFS='|' read -r CL_ID VA_ID ID_ID < "$STATE_FILE"
+  local pfile
+  pfile=$(write_prompt_file)
+  build_cmds "$pfile"
+  local s_claude s_vast s_idc
+  s_claude=$(write_cmd_script claude    "$CLAUDE_CMD")
+  s_vast=$(  write_cmd_script blackwell "$VAST_CMD")
+  s_idc=$(   write_cmd_script 3090s     "$IDC_CMD")
+  /usr/bin/osascript <<APPLESCRIPT || { echo "panes lost — run: $0 start" >&2; rm -f "$STATE_FILE"; exit 1; }
+tell application "iTerm2"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if unique id of s is "${CL_ID}" then
+                    tell s to write text "bash ${s_claude}"
+                else if unique id of s is "${VA_ID}" then
+                    tell s to write text "bash ${s_vast}"
+                else if unique id of s is "${ID_ID}" then
+                    tell s to write text "bash ${s_idc}"
+                end if
+            end repeat
+        end repeat
+    end repeat
+end tell
+APPLESCRIPT
+  echo "go fired | prompt: $pfile"
+}
+
+cmd_reset() {
+  for l in claude blackwell 3090s; do
+    git -C "$CORE_REPO" worktree remove --force "$(worktree_dir "$l")" 2>/dev/null || true
+    rm -rf "$(worktree_dir "$l")"
+  done
+  rm -f "$STATE_FILE"
+  echo "state + worktrees cleared"
+}
+
+main() {
+  local sub="${1:-auto}"; shift || true
+  case "$sub" in
+    start) cmd_start ;;
+    go)    cmd_go ;;
+    reset) cmd_reset ;;
+    auto)  if [[ -s "$STATE_FILE" ]]; then cmd_go; else cmd_start; fi ;;
+    -h|--help|help) sed -n '2,16p' "$0" ;;
+    *) echo "unknown: $sub" >&2; exit 2 ;;
+  esac
+}
+main "$@"
