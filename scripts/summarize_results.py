@@ -58,51 +58,6 @@ def main() -> int:
         print("no matching rows", file=sys.stderr)
         return 1
 
-    print(f"## Runs ({len(rows)})\n")
-    print("| ts            | task                 | label     | model               | tok/s | TTFT | wall  | out  | specs |")
-    print("|---------------|----------------------|-----------|---------------------|------:|-----:|------:|-----:|------:|")
-    for r in rows:
-        print(
-            f"| {r.get('ts','')[5:16]} "
-            f"| {(r.get('task','') or '')[:20]:<20} "
-            f"| {(r.get('label','') or '')[:9]:<9} "
-            f"| {(r.get('model','') or '')[:19]:<19} "
-            f"| {r.get('tok_s','-')!s:>5} "
-            f"| {r.get('ttft','-')!s:>4} "
-            f"| {r.get('wall','-')!s:>5} "
-            f"| {r.get('out_tok','-')!s:>4} "
-            f"| {fmt_specs(r.get('passed'), r.get('total')):>5} |"
-        )
-
-    agg = defaultdict(list)
-    for r in rows:
-        agg[(r.get("task"), r.get("label"))].append(r)
-
-    print(f"\n## Aggregate ({len(agg)} task/backend combos)\n")
-    print("| task                 | label     | runs | mean tok/s | mean TTFT | mean wall | full-pass |")
-    print("|----------------------|-----------|-----:|-----------:|----------:|----------:|----------:|")
-    for (task, label), rs in sorted(agg.items()):
-        tps = [r["tok_s"] for r in rs if r.get("tok_s") is not None]
-        tts = [r["ttft"] for r in rs if r.get("ttft") is not None]
-        wls = [r["wall"] for r in rs if r.get("wall") is not None]
-        full = sum(
-            1 for r in rs
-            if r.get("passed") is not None and r.get("total") and r["passed"] == r["total"]
-        )
-        n = len(rs)
-        m_tps = f"{mean(tps):.1f}" if tps else "-"
-        m_ttft = f"{mean(tts):.2f}" if tts else "-"
-        m_wall = f"{mean(wls):.2f}" if wls else "-"
-        print(
-            f"| {(task or '')[:20]:<20} "
-            f"| {(label or '')[:9]:<9} "
-            f"| {n:>4} "
-            f"| {m_tps:>10} "
-            f"| {m_ttft:>9} "
-            f"| {m_wall:>9} "
-            f"| {full}/{n:<3} |"
-        )
-
     # Wide table: one row per task, columns per backend.
     # Pick the most recent row that has a non-null total per (task,label);
     # fall back to most recent row overall if none have data.
@@ -132,7 +87,7 @@ def main() -> int:
         l for l in sorted(seen_labels) if l not in labels_order
     ]
 
-    print(f"\n## Per-task (latest run per backend)\n")
+    print(f"## Per-task (latest run per backend)\n")
     header = "| task |" + "".join(f" {l} |" for l in labels_order)
     sep = "|------|" + "".join("--------|" for _ in labels_order)
     print(header)
@@ -161,10 +116,18 @@ def main() -> int:
             bits.append(f"{wall:.1f}s")
         return " · ".join(bits)
 
+    import re
+    REPO_URL = "https://github.com/timkoopmans/llm-bench/blob/main"
+    LCB_RE = re.compile(r"^p\d+_")
+    def task_link(t):
+        if LCB_RE.match(t or ""):
+            return f"[{t[:50]}]({REPO_URL}/scripts/specs/lcb/{t}.py)"
+        return f"[{t[:50]}]({REPO_URL}/scripts/specs/{t}.py)"
+
     totals = {l: [0, 0] for l in labels_order}  # passed, total
     for t in sorted(by_task.keys()):
         row = by_task[t]
-        line = f"| {t[:50]} |"
+        line = f"| {task_link(t)} |"
         for l in labels_order:
             r = row.get(l)
             line += f" {cell(r)} |"
