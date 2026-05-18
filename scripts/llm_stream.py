@@ -16,26 +16,27 @@ import urllib.request
 
 def build_request(args, prompt):
     if args.backend == "anthropic":
-        body = json.dumps(
-            {
-                "model": args.model,
-                "max_tokens": args.max_tokens,
-                "temperature": 0,
-                "stream": True,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": prompt,
-                                "cache_control": {"type": "ephemeral"},
-                            }
-                        ],
-                    }
-                ],
-            }
-        ).encode()
+        anth_body = {
+            "model": args.model,
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "stream": True,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ],
+        }
+        if args.top_p is not None:
+            anth_body["top_p"] = args.top_p
+        body = json.dumps(anth_body).encode()
         return urllib.request.Request(
             f"{args.url}/messages",
             data=body,
@@ -46,16 +47,21 @@ def build_request(args, prompt):
             },
             method="POST",
         )
-    body = json.dumps(
-        {
-            "model": args.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": args.max_tokens,
-            "temperature": 0,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-    ).encode()
+    oai_body = {
+        "model": args.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": args.max_tokens,
+        "temperature": args.temperature,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if args.top_p is not None:
+        oai_body["top_p"] = args.top_p
+    if args.frequency_penalty is not None:
+        oai_body["frequency_penalty"] = args.frequency_penalty
+    if args.presence_penalty is not None:
+        oai_body["presence_penalty"] = args.presence_penalty
+    body = json.dumps(oai_body).encode()
     return urllib.request.Request(
         f"{args.url}/chat/completions",
         data=body,
@@ -84,6 +90,14 @@ def main() -> int:
     ap.add_argument("--write-raw", action="store_true", help="write entire raw stream content to --write-file (skip fenced-block extraction; for multi-file refactor)")
     ap.add_argument("--test-cmd", default="", help="shell command to run after --write-file; parses pytest output for pass/total")
     ap.add_argument("--runner", default="python3", help="python interpreter used for --run spec execution")
+    ap.add_argument("--log-file", default="", help="append one JSON line per run to this file")
+    ap.add_argument("--task-name", default="", help="label for the task in the log line (defaults to spec-file basename)")
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--top-p", type=float, default=None, help="OpenAI only")
+    ap.add_argument("--frequency-penalty", type=float, default=None, help="OpenAI only; helps break repetition loops")
+    ap.add_argument("--presence-penalty", type=float, default=None, help="OpenAI only")
+    ap.add_argument("--idle-timeout", type=float, default=60.0, help="seconds to wait for next byte before aborting a hung stream")
+    ap.add_argument("--wall-timeout", type=float, default=0.0, help="hard cap on total request seconds (0 = no cap). Aborts mid-stream and proceeds to footer with what we have.")
     args = ap.parse_args()
 
     with open(args.prompt_file) as fh:
@@ -115,9 +129,13 @@ def main() -> int:
     input_tokens = 0
     collected_content = []  # buffer for --run
 
+    deadline = (t0 + args.wall_timeout) if args.wall_timeout > 0 else None
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=args.idle_timeout) as resp:
             for raw in resp:
+                if deadline is not None and time.perf_counter() > deadline:
+                    print(f"\n\033[1;31m[wall-timeout {args.wall_timeout}s — aborting]\033[0m", flush=True)
+                    break
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 if not line.startswith("data:"):
                     continue
@@ -186,6 +204,15 @@ def main() -> int:
                 sys.stdout.write(RESET)
     except Exception as e:
         print(f"\n\033[1;31mERROR: {e}\033[0m", flush=True)
+        # fall through so we still log a row with whatever we have
+        if args.log_file:
+            wall = time.perf_counter() - t0
+            tps = (output_tokens / wall) if (wall > 0 and output_tokens) else 0.0
+            log_run(
+                args.log_file, args.label, args.model, args.spec, args.spec_file,
+                args.task_name, tps, ttft, wall, input_tokens, output_tokens,
+                {"exit": -3, "passed": 0, "total": 0},
+            )
         return 1
 
     wall = time.perf_counter() - t0
@@ -212,7 +239,41 @@ def main() -> int:
             runner=args.runner,
         )
     print_summary(args.label, args.model, args.spec, result, tps, ttft, output_tokens, wall)
+    if args.log_file:
+        log_run(
+            args.log_file, args.label, args.model, args.spec, args.spec_file,
+            args.task_name, tps, ttft, wall, input_tokens, output_tokens, result,
+        )
     return 0
+
+
+def log_run(path, label, model, hw, spec_file, task_name, tps, ttft, wall, in_tok, out_tok, result):
+    import datetime
+    import os
+    task = task_name
+    if not task:
+        if spec_file:
+            task = os.path.basename(spec_file).rsplit(".", 1)[0]
+        else:
+            task = "unknown"
+    row = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "task": task,
+        "label": label,
+        "model": model,
+        "hw": hw,
+        "ttft": round(ttft, 3) if ttft else None,
+        "wall": round(wall, 3),
+        "tok_s": round(tps, 1),
+        "in_tok": int(in_tok or 0),
+        "out_tok": int(out_tok or 0),
+        "passed": (result or {}).get("passed"),
+        "total": (result or {}).get("total"),
+        "exit": (result or {}).get("exit"),
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a") as fh:
+        fh.write(json.dumps(row) + "\n")
 
 
 def run_sandbox(content: str, label: str, write_file: str, test_cmd: str, raw: bool = False):

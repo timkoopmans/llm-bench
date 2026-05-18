@@ -53,15 +53,25 @@ MAX_TOKENS="${MAX_TOKENS:-8192}"
 COUNTDOWN="${COUNTDOWN:-5}"
 RUNNER="${RUNNER:-${SCRIPT_DIR}/../.venv/bin/python3}"
 [[ -x "$RUNNER" ]] || RUNNER="python3"
+LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/../results.jsonl}"
+TEMPERATURE="${TEMPERATURE:-0}"
+FREQ_PENALTY="${FREQ_PENALTY:-}"
+PRES_PENALTY="${PRES_PENALTY:-}"
+TOP_P="${TOP_P:-}"
+WALL_TIMEOUT="${WALL_TIMEOUT:-45}"
+SAMPLING_ARGS="--temperature ${TEMPERATURE} --wall-timeout ${WALL_TIMEOUT}"
+[[ -n "$FREQ_PENALTY" ]] && SAMPLING_ARGS="${SAMPLING_ARGS} --frequency-penalty ${FREQ_PENALTY}"
+[[ -n "$PRES_PENALTY" ]] && SAMPLING_ARGS="${SAMPLING_ARGS} --presence-penalty ${PRES_PENALTY}"
+[[ -n "$TOP_P" ]] && SAMPLING_ARGS="${SAMPLING_ARGS} --top-p ${TOP_P}"
 
 build_cmds() {
   local p="$1"
   local CLAUDE_SPEC="Anthropic API (hosted)"
   local VAST_SPEC="1x RTX PRO 6000 Blackwell SE, 96GB, vLLM FP8 ctx 131072"
   local IDC_SPEC="2x RTX 3090, 48GB total, llama.cpp GGUF"
-  CLAUDE_CMD="python3 '${STREAM}' --backend anthropic --label claude --url https://api.anthropic.com/v1 --model '${CLAUDE_MODEL}' --prompt-file '${p}' --api-key '${ANTHROPIC_API_KEY}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${CLAUDE_SPEC}' --spec-file '${SPEC_FILE}'"
-  VAST_CMD="python3 '${STREAM}' --label blackwell --url http://${VAST_HOST}:${VAST_PORT}/v1 --model '${VAST_MODEL}' --prompt-file '${p}' --api-key '${VLLM_API_KEY:-EMPTY}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${VAST_SPEC}' --spec-file '${SPEC_FILE}'"
-  IDC_CMD="python3 '${STREAM}' --label 3090s --url http://${IDC_HOST}:${IDC_PORT}/v1 --model '${IDC_MODEL}' --prompt-file '${p}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${IDC_SPEC}' --spec-file '${SPEC_FILE}'"
+  CLAUDE_CMD="python3 '${STREAM}' --backend anthropic --label claude --url https://api.anthropic.com/v1 --model '${CLAUDE_MODEL}' --prompt-file '${p}' --api-key '${ANTHROPIC_API_KEY}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${CLAUDE_SPEC}' --spec-file '${SPEC_FILE}' --log-file '${LOG_FILE}' ${SAMPLING_ARGS}"
+  VAST_CMD="python3 '${STREAM}' --label blackwell --url http://${VAST_HOST}:${VAST_PORT}/v1 --model '${VAST_MODEL}' --prompt-file '${p}' --api-key '${VLLM_API_KEY:-EMPTY}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${VAST_SPEC}' --spec-file '${SPEC_FILE}' --log-file '${LOG_FILE}' ${SAMPLING_ARGS}"
+  IDC_CMD="python3 '${STREAM}' --label 3090s --url http://${IDC_HOST}:${IDC_PORT}/v1 --model '${IDC_MODEL}' --prompt-file '${p}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${IDC_SPEC}' --spec-file '${SPEC_FILE}' --log-file '${LOG_FILE}' ${SAMPLING_ARGS}"
 }
 
 write_prompt() {
