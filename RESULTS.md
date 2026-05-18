@@ -1,4 +1,4 @@
-## Runs (87)
+## Runs (112)
 
 | ts            | task                 | label     | model               | tok/s | TTFT | wall  | out  | specs |
 |---------------|----------------------|-----------|---------------------|------:|-----:|------:|-----:|------:|
@@ -89,8 +89,33 @@
 | 05-18T07:49 | p3779_eat_pizzas     | blackwell | gpt-oss             |   0.0 | None | 60.011 |    0 |     - |
 | 05-18T07:49 | p3791_fruits_into_ba | 3090s     | qwen-coder          | 146.1 | 0.49 | 1.886 |  204 |   2/2 |
 | 05-18T07:49 | p3791_fruits_into_ba | claude    | claude-sonnet-4-6   | 103.8 | 1.288 | 11.153 | 1024 |   2/2 |
+| 05-18T07:50 | p3794_find_the_minim | 3090s     | qwen-coder          | 147.7 | 1.65 | 4.013 |  349 |   0/3 |
+| 05-18T07:50 | p3791_fruits_into_ba | blackwell | gpt-oss             | 171.7 | 0.177 | 7.689 | 1290 |   2/2 |
+| 05-18T07:50 | p3794_find_the_minim | claude    | claude-sonnet-4-6   |  79.7 | 0.979 | 18.177 | 1370 |   3/3 |
+| 05-18T07:51 | p3795_zero_array_tra | 3090s     | qwen-coder          | 143.5 | 0.742 | 2.596 |  266 |     - |
+| 05-18T07:51 | p3794_find_the_minim | blackwell | gpt-oss             | 170.7 | 0.178 | 18.438 | 3117 |   3/3 |
+| 05-18T07:51 | p3795_zero_array_tra | claude    | claude-sonnet-4-6   |  78.8 | 1.255 | 19.838 | 1464 |   4/4 |
+| 05-18T07:51 | p3809_properties_gra | 3090s     | qwen-coder          | 148.9 | 0.531 | 2.123 |  237 |   3/3 |
+| 05-18T07:51 | p3809_properties_gra | claude    | claude-sonnet-4-6   | 136.3 | 1.662 | 3.335 |  228 |   3/3 |
+| 05-18T07:51 | p3795_zero_array_tra | blackwell | gpt-oss             |   0.0 | 0.196 | 45.006 |    0 |     - |
+| 05-18T07:52 | p3817_maximum_contai | 3090s     | qwen-coder          | 143.9 | 0.478 | 1.214 |  106 |   2/2 |
+| 05-18T07:52 | p3817_maximum_contai | claude    | claude-sonnet-4-6   |  85.9 | 1.636 | 2.229 |   51 |   2/2 |
+| 05-18T07:52 | p3809_properties_gra | blackwell | gpt-oss             |   0.0 | None | 45.008 |    0 |     - |
+| 05-18T07:52 | p3832_minimum_cost_t | claude    | claude-sonnet-4-6   | 130.7 | 1.826 | 2.545 |   94 |   2/2 |
+| 05-18T07:53 | p3832_minimum_cost_t | 3090s     | qwen-coder          | 143.1 | 0.605 | 14.878 | 2042 |   0/2 |
+| 05-18T07:53 | p3817_maximum_contai | blackwell | gpt-oss             |   0.0 | None | 45.003 |    0 |     - |
+| 05-18T07:54 | p3832_minimum_cost_t | blackwell | gpt-oss             |   0.0 | None | 45.004 |    0 |     - |
+| 05-18T07:58 | p3786_longest_palind | 3090s     | qwen-coder          | 145.8 | 0.466 |  7.75 | 1062 |     - |
+| 05-18T07:58 | p3786_longest_palind | blackwell | gpt-oss             | 171.4 | 0.166 | 9.922 | 1672 |     - |
+| 05-18T07:58 | p3786_longest_palind | claude    | claude-sonnet-4-6   | 100.2 | 1.692 | 14.839 | 1318 |     - |
+| 05-18T07:58 | p3788_maximum_unique | 3090s     | qwen-coder          | 146.8 | 0.343 | 1.603 |  185 |     - |
+| 05-18T07:58 | p3788_maximum_unique | claude    | claude-sonnet-4-6   |  65.4 | 1.641 | 9.495 |  514 |     - |
+| 05-18T07:58 | p3788_maximum_unique | blackwell | gpt-oss             |   0.0 | None | 45.002 |    0 |     - |
+| 05-18T07:59 | p3832_minimum_cost_t | claude    | claude-sonnet-4-6   | 113.1 | 1.317 | 2.148 |   94 |     - |
+| 05-18T07:59 | p3832_minimum_cost_t | 3090s     | qwen-coder          | 141.8 | 0.399 | 2.424 |  287 |     - |
+| 05-18T07:59 | p3832_minimum_cost_t | blackwell | gpt-oss             |   0.0 | None | 45.005 |    0 |     - |
 
-## Aggregate (72 task/backend combos)
+## Aggregate (90 task/backend combos)
 
 | task                 | label     | runs | mean tok/s | mean TTFT | mean wall | full-pass |
 |----------------------|-----------|-----:|-----------:|----------:|----------:|----------:|
@@ -160,9 +185,27 @@
 | p3779_eat_pizzas     | 3090s     |    1 |      148.9 |      0.47 |      1.94 | 0/1   |
 | p3779_eat_pizzas     | blackwell |    1 |        0.0 |         - |     60.01 | 0/1   |
 | p3779_eat_pizzas     | claude    |    1 |       70.4 |      2.07 |     19.08 | 1/1   |
-| p3786_longest_palind | 3090s     |    1 |      144.2 |      0.47 |     12.98 | 1/1   |
-| p3786_longest_palind | claude    |    1 |      105.6 |      1.29 |     14.62 | 1/1   |
-| p3788_maximum_unique | 3090s     |    1 |      149.2 |      0.43 |      1.67 | 1/1   |
-| p3788_maximum_unique | claude    |    1 |       67.7 |      1.56 |     13.80 | 1/1   |
+| p3786_longest_palind | 3090s     |    2 |      145.0 |      0.47 |     10.37 | 1/2   |
+| p3786_longest_palind | blackwell |    1 |      171.4 |      0.17 |      9.92 | 0/1   |
+| p3786_longest_palind | claude    |    2 |      102.9 |      1.49 |     14.73 | 1/2   |
+| p3788_maximum_unique | 3090s     |    2 |      148.0 |      0.39 |      1.64 | 1/2   |
+| p3788_maximum_unique | blackwell |    1 |        0.0 |         - |     45.00 | 0/1   |
+| p3788_maximum_unique | claude    |    2 |       66.6 |      1.60 |     11.65 | 1/2   |
 | p3791_fruits_into_ba | 3090s     |    1 |      146.1 |      0.49 |      1.89 | 1/1   |
+| p3791_fruits_into_ba | blackwell |    1 |      171.7 |      0.18 |      7.69 | 1/1   |
 | p3791_fruits_into_ba | claude    |    1 |      103.8 |      1.29 |     11.15 | 1/1   |
+| p3794_find_the_minim | 3090s     |    1 |      147.7 |      1.65 |      4.01 | 0/1   |
+| p3794_find_the_minim | blackwell |    1 |      170.7 |      0.18 |     18.44 | 1/1   |
+| p3794_find_the_minim | claude    |    1 |       79.7 |      0.98 |     18.18 | 1/1   |
+| p3795_zero_array_tra | 3090s     |    1 |      143.5 |      0.74 |      2.60 | 0/1   |
+| p3795_zero_array_tra | blackwell |    1 |        0.0 |      0.20 |     45.01 | 0/1   |
+| p3795_zero_array_tra | claude    |    1 |       78.8 |      1.25 |     19.84 | 1/1   |
+| p3809_properties_gra | 3090s     |    1 |      148.9 |      0.53 |      2.12 | 1/1   |
+| p3809_properties_gra | blackwell |    1 |        0.0 |         - |     45.01 | 0/1   |
+| p3809_properties_gra | claude    |    1 |      136.3 |      1.66 |      3.33 | 1/1   |
+| p3817_maximum_contai | 3090s     |    1 |      143.9 |      0.48 |      1.21 | 1/1   |
+| p3817_maximum_contai | blackwell |    1 |        0.0 |         - |     45.00 | 0/1   |
+| p3817_maximum_contai | claude    |    1 |       85.9 |      1.64 |      2.23 | 1/1   |
+| p3832_minimum_cost_t | 3090s     |    2 |      142.4 |      0.50 |      8.65 | 0/2   |
+| p3832_minimum_cost_t | blackwell |    2 |        0.0 |         - |     45.00 | 0/2   |
+| p3832_minimum_cost_t | claude    |    2 |      121.9 |      1.57 |      2.35 | 1/2   |

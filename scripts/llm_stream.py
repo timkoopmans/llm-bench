@@ -130,6 +130,13 @@ def main() -> int:
     collected_content = []  # buffer for --run
 
     deadline = (t0 + args.wall_timeout) if args.wall_timeout > 0 else None
+    # Hard kill via SIGALRM so a silent socket can't outlast the wall budget.
+    import signal
+    def _wall_alarm(signum, frame):
+        raise TimeoutError(f"wall-timeout {args.wall_timeout}s")
+    if args.wall_timeout > 0:
+        signal.signal(signal.SIGALRM, _wall_alarm)
+        signal.setitimer(signal.ITIMER_REAL, args.wall_timeout)
     try:
         with urllib.request.urlopen(req, timeout=args.idle_timeout) as resp:
             for raw in resp:
@@ -204,6 +211,8 @@ def main() -> int:
                 sys.stdout.write(RESET)
     except Exception as e:
         print(f"\n\033[1;31mERROR: {e}\033[0m", flush=True)
+        if args.wall_timeout > 0:
+            signal.setitimer(signal.ITIMER_REAL, 0)  # disarm
         # fall through so we still log a row with whatever we have
         if args.log_file:
             wall = time.perf_counter() - t0
@@ -214,6 +223,12 @@ def main() -> int:
                 {"exit": -3, "passed": 0, "total": 0},
             )
         return 1
+    finally:
+        if args.wall_timeout > 0:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            except Exception:
+                pass
 
     wall = time.perf_counter() - t0
     gen = wall - (ttft or 0)
