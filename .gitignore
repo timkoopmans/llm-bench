@@ -1,5 +1,7 @@
 .env
 .venv/
+.claude/
+.litellm-blackwell.yaml
 __pycache__/
 *.pyc
 *.pyo
