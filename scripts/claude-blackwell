@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Launch Claude Code against the vast.ai Blackwell vLLM endpoint via a local
+# LiteLLM proxy that translates Anthropic <-> OpenAI.
+#
+# Usage:
+#   claude-blackwell                  # start proxy if needed, run claude
+#   claude-blackwell proxy            # foreground proxy only
+#   claude-blackwell stop             # kill background proxy
+#   claude-blackwell status           # show proxy state + upstream probe
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/../.env"
+[[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE" >&2; exit 1; }
+set -a; . "$ENV_FILE"; set +a
+
+: "${BLACKWELL_HOST:?BLACKWELL_HOST not set in .env}"
+: "${BLACKWELL_PORT:?BLACKWELL_PORT not set in .env}"
+MODEL="${BLACKWELL_MODEL_NAME:-qwen36}"
+PROXY_PORT="${CLAUDE_PROXY_PORT:-4000}"
+CONFIG="${SCRIPT_DIR}/../.litellm-blackwell.yaml"
+PIDFILE="/tmp/claude-blackwell-proxy.pid"
+LOGFILE="/tmp/claude-blackwell-proxy.log"
+
+need() { command -v "$1" >/dev/null || { echo "need $1" >&2; exit 1; }; }
+need claude
+need curl
+
+write_config() {
+  cat >"$CONFIG" <<EOF
+model_list:
+  - model_name: ${MODEL}
+    litellm_params:
+      model: openai/${MODEL}
+      api_base: http://${BLACKWELL_HOST}:${BLACKWELL_PORT}/v1
+      api_key: ${VLLM_API_KEY:-EMPTY}
+litellm_settings:
+  drop_params: true
+EOF
+}
+
+proxy_alive() {
+  curl -fsS "http://127.0.0.1:${PROXY_PORT}/health/liveliness" >/dev/null 2>&1
+}
+
+litellm_cmd() {
+  if command -v litellm >/dev/null; then
+    echo "litellm"
+  elif (cd "$SCRIPT_DIR/.." && uv run --no-sync litellm --version) >/dev/null 2>&1; then
+    echo "uv-run"
+  else
+    echo ""
+  fi
+}
+
+start_proxy_bg() {
+  if proxy_alive; then return 0; fi
+  local mode; mode=$(litellm_cmd)
+  [[ -n "$mode" ]] || { echo "litellm not installed. cd $SCRIPT_DIR/.. && uv add --dev 'litellm[proxy]'" >&2; exit 1; }
+  write_config
+  if [[ "$mode" == "uv-run" ]]; then
+    (cd "$SCRIPT_DIR/.." && nohup uv run --no-sync litellm --config "$CONFIG" --port "$PROXY_PORT" >"$LOGFILE" 2>&1 &
+      echo $! >"$PIDFILE")
+  else
+    nohup litellm --config "$CONFIG" --port "$PROXY_PORT" >"$LOGFILE" 2>&1 &
+    echo $! >"$PIDFILE"
+  fi
+  for _ in $(seq 1 40); do
+    proxy_alive && return 0
+    sleep 0.5
+  done
+  echo "proxy failed to start. see $LOGFILE" >&2
+  exit 1
+}
+
+cmd_proxy() {
+  local mode; mode=$(litellm_cmd)
+  [[ -n "$mode" ]] || { echo "litellm not installed" >&2; exit 1; }
+  write_config
+  if [[ "$mode" == "uv-run" ]]; then
+    cd "$SCRIPT_DIR/.." && exec uv run --no-sync litellm --config "$CONFIG" --port "$PROXY_PORT"
+  else
+    exec litellm --config "$CONFIG" --port "$PROXY_PORT"
+  fi
+}
+
+cmd_stop() {
+  if [[ -f "$PIDFILE" ]]; then
+    kill "$(cat "$PIDFILE")" 2>/dev/null || true
+    rm -f "$PIDFILE"
+    echo "proxy stopped"
+  else
+    echo "no pidfile"
+  fi
+}
+
+cmd_status() {
+  echo "upstream: http://${BLACKWELL_HOST}:${BLACKWELL_PORT}/v1 (model=${MODEL})"
+  curl -fsS "http://${BLACKWELL_HOST}:${BLACKWELL_PORT}/v1/models" | head -c 400 || echo "upstream unreachable"
+  echo
+  if proxy_alive; then
+    echo "proxy: alive on :${PROXY_PORT}"
+  else
+    echo "proxy: down"
+  fi
+}
+
+cmd_run() {
+  start_proxy_bg
+  unset ANTHROPIC_API_KEY
+  export ANTHROPIC_BASE_URL="http://127.0.0.1:${PROXY_PORT}"
+  export ANTHROPIC_AUTH_TOKEN="sk-local"
+  export ANTHROPIC_MODEL="${MODEL}"
+  export ANTHROPIC_SMALL_FAST_MODEL="${MODEL}"
+  exec claude "$@"
+}
+
+case "${1:-run}" in
+  proxy)  cmd_proxy ;;
+  stop)   cmd_stop ;;
+  status) cmd_status ;;
+  run|"") shift || true; cmd_run "$@" ;;
+  *) echo "usage: $0 [run|proxy|stop|status]" >&2; exit 2 ;;
+esac
