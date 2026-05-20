@@ -16,6 +16,12 @@ set -a; . "$ENV_FILE"; set +a
 STATE_FILE=/tmp/llm-compare-panes
 STREAM="${SCRIPT_DIR}/llm_stream.py"
 SPEC_FILE="${SPEC_FILE:-${SCRIPT_DIR}/specs/lfucache.py}"
+# Resolve to absolute path — iTerm panes inherit different cwd, relative paths break.
+case "$SPEC_FILE" in
+  /*) ;;
+  *)  SPEC_FILE="$(cd "$(dirname "$SPEC_FILE")" && pwd)/$(basename "$SPEC_FILE")" ;;
+esac
+[[ -f "$SPEC_FILE" ]] || { echo "SPEC_FILE not found: $SPEC_FILE" >&2; exit 1; }
 
 # Single canonical task for repeatable spec comparison.
 # Same prompt every run (cache-busted via nonce in write_prompt).
@@ -49,7 +55,8 @@ VAST_PORT="${BLACKWELL_PORT:?BLACKWELL_PORT not set}"
 VAST_MODEL="${BLACKWELL_MODEL_NAME:-qwen36}"
 : "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY not set}"
 
-MAX_TOKENS="${MAX_TOKENS:-8192}"
+MAX_TOKENS="${MAX_TOKENS:-32768}"
+QWEN_THINKING="${QWEN_THINKING:-on}"   # on|off|auto — drives chat_template_kwargs.enable_thinking
 COUNTDOWN="${COUNTDOWN:-5}"
 RUNNER="${RUNNER:-${SCRIPT_DIR}/../.venv/bin/python3}"
 [[ -x "$RUNNER" ]] || RUNNER="python3"
@@ -67,7 +74,7 @@ QWEN_TOP_P="${QWEN_TOP_P:-${TOP_P:-0.95}}"
 QWEN_TOP_K="${QWEN_TOP_K:-20}"
 QWEN_MIN_P="${QWEN_MIN_P:-0}"
 QWEN_PRES_PENALTY="${QWEN_PRES_PENALTY:-${PRES_PENALTY:-0}}"
-QWEN_FREQ_PENALTY="${QWEN_FREQ_PENALTY:-${FREQ_PENALTY:-}}"
+QWEN_FREQ_PENALTY="${QWEN_FREQ_PENALTY:-${FREQ_PENALTY:-0.5}}"  # discourage n-gram repeats in reasoning loops
 
 claude_sampling() {
   local s="--temperature ${CLAUDE_TEMPERATURE} --wall-timeout ${WALL_TIMEOUT}"
@@ -81,6 +88,7 @@ qwen_sampling() {
   [[ -n "$QWEN_MIN_P" ]]        && s="${s} --min-p ${QWEN_MIN_P}"
   [[ -n "$QWEN_PRES_PENALTY" ]] && s="${s} --presence-penalty ${QWEN_PRES_PENALTY}"
   [[ -n "$QWEN_FREQ_PENALTY" ]] && s="${s} --frequency-penalty ${QWEN_FREQ_PENALTY}"
+  [[ -n "$QWEN_THINKING" ]]     && s="${s} --thinking ${QWEN_THINKING}"
   echo "$s"
 }
 CLAUDE_SAMPLING="$(claude_sampling)"

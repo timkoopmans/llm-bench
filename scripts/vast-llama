@@ -31,8 +31,9 @@ DISK_GB="${VAST_DISK_GB:-120}"
 HF_REPO="${LLAMA_HF_REPO:-unsloth/Qwen3.6-35B-A3B-MTP-GGUF}"
 HF_QUANT="${LLAMA_HF_QUANT:-UD-Q8_K_XL}"
 SERVED_NAME="${BLACKWELL_MODEL_NAME:-qwen36}"
-CTX="${LLAMA_CTX:-65536}"
+CTX="${LLAMA_CTX:-131072}"
 MTP_N="${LLAMA_MTP_N:-2}"
+REASONING_BUDGET="${LLAMA_REASONING_BUDGET:-4096}"  # cap thinking tokens; -1 = unlimited
 
 need() { command -v "$1" >/dev/null || { echo "need $1" >&2; exit 1; }; }
 need vastai
@@ -119,6 +120,7 @@ exec /workspace/llama.cpp/llama-server \\
   -ngl 99 -c ${CTX} \\
   --temp 0.6 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 0.0 \\
   --spec-type draft-mtp --spec-draft-n-max ${MTP_N} \\
+  --reasoning-budget ${REASONING_BUDGET} \\
   --jinja
 EOF
   chmod +x "$launcher"
@@ -126,7 +128,7 @@ EOF
   scp -q $(ssh_args | sed 's/-p /-P /') "$launcher" "$(ssh_target):/workspace/launch.sh"
   rm -f "$launcher"
   cmd_ssh "tmux kill-session -t llama 2>/dev/null; pkill -f llama-server 2>/dev/null; sleep 1; mkdir -p /var/log; true"
-  cmd_ssh tmux new-session -d -s llama "'/workspace/launch.sh > /var/log/llama.log 2>&1'"
+  cmd_ssh "tmux new-session -d -s llama 'bash /workspace/launch.sh > /var/log/llama.log 2>&1'"
   sleep 3
   cmd_ssh "tmux ls; pgrep -af /workspace/llama.cpp/llama-server | grep -v pgrep || echo NOT_RUNNING"
 }

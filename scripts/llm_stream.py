@@ -65,6 +65,8 @@ def build_request(args, prompt):
         oai_body["frequency_penalty"] = args.frequency_penalty
     if args.presence_penalty is not None:
         oai_body["presence_penalty"] = args.presence_penalty
+    if args.thinking in ("on", "off"):
+        oai_body["chat_template_kwargs"] = {"enable_thinking": args.thinking == "on"}
     body = json.dumps(oai_body).encode()
     return urllib.request.Request(
         f"{args.url}/chat/completions",
@@ -100,6 +102,8 @@ def main() -> int:
     ap.add_argument("--top-p", type=float, default=None, help="OpenAI only")
     ap.add_argument("--top-k", type=int, default=None, help="OpenAI extra (llama.cpp/vllm)")
     ap.add_argument("--min-p", type=float, default=None, help="OpenAI extra (llama.cpp/vllm)")
+    ap.add_argument("--thinking", choices=["on", "off", "auto"], default="auto",
+                    help="Qwen3.6 thinking toggle via chat_template_kwargs.enable_thinking. 'auto' = omit field (server default).")
     ap.add_argument("--frequency-penalty", type=float, default=None, help="OpenAI only; helps break repetition loops")
     ap.add_argument("--presence-penalty", type=float, default=None, help="OpenAI only")
     ap.add_argument("--idle-timeout", type=float, default=60.0, help="seconds to wait for next byte before aborting a hung stream")
@@ -383,12 +387,25 @@ def run_extracted(content: str, label: str, spec_file: str = "", runner: str = "
     if not code.strip():
         print("\033[1;31mno code extracted\033[0m", flush=True)
         return {"exit": 1, "passed": 0, "total": 0}
-    full = code
+    # LeetCode-style answers commonly use unimported typing aliases (List, Dict, ...)
+    # and collections (deque, defaultdict). Prepend a safe stdlib preamble so a
+    # correct solution doesn't NameError before tests run.
+    preamble = (
+        "from typing import List, Dict, Tuple, Set, Optional, Any, Iterable, Iterator\n"
+        "from collections import defaultdict, Counter, deque, OrderedDict\n"
+        "from functools import lru_cache, cache, reduce\n"
+        "from itertools import accumulate, combinations, permutations, product, chain\n"
+        "from heapq import heappush, heappop, heapify, nlargest, nsmallest\n"
+        "from bisect import bisect_left, bisect_right, insort\n"
+        "import math\n"
+        "\n"
+    )
+    full = preamble + code
     if spec_file:
         try:
             with open(spec_file) as fh:
                 spec_src = fh.read()
-            full = code + "\n\n# === canonical spec ===\n" + spec_src
+            full = preamble + code + "\n\n# === canonical spec ===\n" + spec_src
         except OSError as e:
             print(f"\033[1;31mspec-file unreadable: {e}\033[0m", flush=True)
     with tempfile.NamedTemporaryFile(
