@@ -44,9 +44,9 @@ CLAUDE_MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
 IDC_HOST="${LLM_HOST:-idc-1}"
 IDC_PORT="${LLM_PORT:-8001}"
 IDC_MODEL="${LLM_MODEL_NAME:-unsloth/Qwen3.6-35B-A3B}"
-VAST_HOST="${VLLM_HOST:?VLLM_HOST not set}"
-VAST_PORT="${VLLM_PORT:?VLLM_PORT not set}"
-VAST_MODEL="${VLLM_MODEL_NAME:-qwen-coder}"
+VAST_HOST="${BLACKWELL_HOST:?BLACKWELL_HOST not set}"
+VAST_PORT="${BLACKWELL_PORT:?BLACKWELL_PORT not set}"
+VAST_MODEL="${BLACKWELL_MODEL_NAME:-qwen36}"
 : "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY not set}"
 
 MAX_TOKENS="${MAX_TOKENS:-8192}"
@@ -54,24 +54,46 @@ COUNTDOWN="${COUNTDOWN:-5}"
 RUNNER="${RUNNER:-${SCRIPT_DIR}/../.venv/bin/python3}"
 [[ -x "$RUNNER" ]] || RUNNER="python3"
 LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/../results.jsonl}"
-TEMPERATURE="${TEMPERATURE:-0}"
-FREQ_PENALTY="${FREQ_PENALTY:-}"
-PRES_PENALTY="${PRES_PENALTY:-}"
-TOP_P="${TOP_P:-}"
 WALL_TIMEOUT="${WALL_TIMEOUT:-45}"
-SAMPLING_ARGS="--temperature ${TEMPERATURE} --wall-timeout ${WALL_TIMEOUT}"
-[[ -n "$FREQ_PENALTY" ]] && SAMPLING_ARGS="${SAMPLING_ARGS} --frequency-penalty ${FREQ_PENALTY}"
-[[ -n "$PRES_PENALTY" ]] && SAMPLING_ARGS="${SAMPLING_ARGS} --presence-penalty ${PRES_PENALTY}"
-[[ -n "$TOP_P" ]] && SAMPLING_ARGS="${SAMPLING_ARGS} --top-p ${TOP_P}"
+
+# Per-backend sampling. Defaults match each model's recommended settings.
+# Claude: deterministic (temp 0). Qwen3.6 thinking precise-coding (Unsloth guide):
+# temp 0.6, top_p 0.95, top_k 20, min_p 0, presence 0. Override any via env.
+CLAUDE_TEMPERATURE="${CLAUDE_TEMPERATURE:-${TEMPERATURE:-0}}"
+CLAUDE_TOP_P="${CLAUDE_TOP_P:-${TOP_P:-}}"
+
+QWEN_TEMPERATURE="${QWEN_TEMPERATURE:-${TEMPERATURE:-0.6}}"
+QWEN_TOP_P="${QWEN_TOP_P:-${TOP_P:-0.95}}"
+QWEN_TOP_K="${QWEN_TOP_K:-20}"
+QWEN_MIN_P="${QWEN_MIN_P:-0}"
+QWEN_PRES_PENALTY="${QWEN_PRES_PENALTY:-${PRES_PENALTY:-0}}"
+QWEN_FREQ_PENALTY="${QWEN_FREQ_PENALTY:-${FREQ_PENALTY:-}}"
+
+claude_sampling() {
+  local s="--temperature ${CLAUDE_TEMPERATURE} --wall-timeout ${WALL_TIMEOUT}"
+  [[ -n "$CLAUDE_TOP_P" ]] && s="${s} --top-p ${CLAUDE_TOP_P}"
+  echo "$s"
+}
+qwen_sampling() {
+  local s="--temperature ${QWEN_TEMPERATURE} --wall-timeout ${WALL_TIMEOUT}"
+  [[ -n "$QWEN_TOP_P" ]]        && s="${s} --top-p ${QWEN_TOP_P}"
+  [[ -n "$QWEN_TOP_K" ]]        && s="${s} --top-k ${QWEN_TOP_K}"
+  [[ -n "$QWEN_MIN_P" ]]        && s="${s} --min-p ${QWEN_MIN_P}"
+  [[ -n "$QWEN_PRES_PENALTY" ]] && s="${s} --presence-penalty ${QWEN_PRES_PENALTY}"
+  [[ -n "$QWEN_FREQ_PENALTY" ]] && s="${s} --frequency-penalty ${QWEN_FREQ_PENALTY}"
+  echo "$s"
+}
+CLAUDE_SAMPLING="$(claude_sampling)"
+QWEN_SAMPLING="$(qwen_sampling)"
 
 build_cmds() {
   local p="$1"
   local CLAUDE_SPEC="Anthropic API (hosted)"
-  local VAST_SPEC="1x RTX PRO 6000 Blackwell SE, 96GB, vLLM FP8 ctx 131072"
+  local VAST_SPEC="1x RTX PRO 6000 Blackwell SE, 96GB, llama.cpp Qwen3.6-35B UD-Q8_K_XL MTP"
   local IDC_SPEC="2x RTX 3090, 48GB total, llama.cpp GGUF"
-  CLAUDE_CMD="python3 '${STREAM}' --backend anthropic --label claude --url https://api.anthropic.com/v1 --model '${CLAUDE_MODEL}' --prompt-file '${p}' --api-key '${ANTHROPIC_API_KEY}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${CLAUDE_SPEC}' --spec-file '${SPEC_FILE}' --log-file '${LOG_FILE}' ${SAMPLING_ARGS}"
-  VAST_CMD="python3 '${STREAM}' --label blackwell --url http://${VAST_HOST}:${VAST_PORT}/v1 --model '${VAST_MODEL}' --prompt-file '${p}' --api-key '${VLLM_API_KEY:-EMPTY}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${VAST_SPEC}' --spec-file '${SPEC_FILE}' --log-file '${LOG_FILE}' ${SAMPLING_ARGS}"
-  IDC_CMD="python3 '${STREAM}' --label 3090s --url http://${IDC_HOST}:${IDC_PORT}/v1 --model '${IDC_MODEL}' --prompt-file '${p}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${IDC_SPEC}' --spec-file '${SPEC_FILE}' --log-file '${LOG_FILE}' ${SAMPLING_ARGS}"
+  CLAUDE_CMD="python3 '${STREAM}' --backend anthropic --label claude --url https://api.anthropic.com/v1 --model '${CLAUDE_MODEL}' --prompt-file '${p}' --api-key '${ANTHROPIC_API_KEY}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${CLAUDE_SPEC}' --spec-file '${SPEC_FILE}' --log-file '${LOG_FILE}' ${CLAUDE_SAMPLING}"
+  VAST_CMD="python3 '${STREAM}' --label blackwell --url http://${VAST_HOST}:${VAST_PORT}/v1 --model '${VAST_MODEL}' --prompt-file '${p}' --api-key 'EMPTY' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${VAST_SPEC}' --spec-file '${SPEC_FILE}' --log-file '${LOG_FILE}' ${QWEN_SAMPLING}"
+  IDC_CMD="python3 '${STREAM}' --label 3090s --url http://${IDC_HOST}:${IDC_PORT}/v1 --model '${IDC_MODEL}' --prompt-file '${p}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${IDC_SPEC}' --spec-file '${SPEC_FILE}' --log-file '${LOG_FILE}' ${QWEN_SAMPLING}"
 }
 
 write_prompt() {
@@ -123,23 +145,35 @@ cmd_go() {
   IFS='|' read -r CL_ID VA_ID ID_ID < "$STATE_FILE"
   pfile=$(write_prompt "$prompt")
   build_cmds "$pfile"
-  /usr/bin/osascript <<APPLESCRIPT || { echo "panes lost — run: $0 start" >&2; rm -f "$STATE_FILE"; exit 1; }
+  local matched
+  matched=$(/usr/bin/osascript <<APPLESCRIPT
 tell application "iTerm2"
+    set hitCount to 0
     repeat with w in windows
         repeat with t in tabs of w
             repeat with s in sessions of t
                 if unique id of s is "${CL_ID}" then
                     tell s to write text "clear; ${CLAUDE_CMD//\"/\\\"}"
+                    set hitCount to hitCount + 1
                 else if unique id of s is "${VA_ID}" then
                     tell s to write text "clear; ${VAST_CMD//\"/\\\"}"
+                    set hitCount to hitCount + 1
                 else if unique id of s is "${ID_ID}" then
                     tell s to write text "clear; ${IDC_CMD//\"/\\\"}"
+                    set hitCount to hitCount + 1
                 end if
             end repeat
         end repeat
     end repeat
+    return hitCount
 end tell
 APPLESCRIPT
+) || { echo "osascript failed" >&2; exit 1; }
+  if [[ "$matched" != "3" ]]; then
+    echo "panes lost (matched ${matched}/3) — clearing state, run: $0 start" >&2
+    rm -f "$STATE_FILE"
+    exit 1
+  fi
   echo "go fired in cached panes | prompt: $pfile"
 }
 

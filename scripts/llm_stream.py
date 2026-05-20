@@ -57,6 +57,10 @@ def build_request(args, prompt):
     }
     if args.top_p is not None:
         oai_body["top_p"] = args.top_p
+    if args.top_k is not None:
+        oai_body["top_k"] = args.top_k
+    if args.min_p is not None:
+        oai_body["min_p"] = args.min_p
     if args.frequency_penalty is not None:
         oai_body["frequency_penalty"] = args.frequency_penalty
     if args.presence_penalty is not None:
@@ -94,6 +98,8 @@ def main() -> int:
     ap.add_argument("--task-name", default="", help="label for the task in the log line (defaults to spec-file basename)")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top-p", type=float, default=None, help="OpenAI only")
+    ap.add_argument("--top-k", type=int, default=None, help="OpenAI extra (llama.cpp/vllm)")
+    ap.add_argument("--min-p", type=float, default=None, help="OpenAI extra (llama.cpp/vllm)")
     ap.add_argument("--frequency-penalty", type=float, default=None, help="OpenAI only; helps break repetition loops")
     ap.add_argument("--presence-penalty", type=float, default=None, help="OpenAI only")
     ap.add_argument("--idle-timeout", type=float, default=60.0, help="seconds to wait for next byte before aborting a hung stream")
