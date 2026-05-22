@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# 3-way iTerm2 comparison: Claude | 3090x2 idc-1 | RTX PRO 5000 Blackwell vast.
+# Both Qwen panes serve Qwen3-Coder-30B Q5_K_M for a direct hardware compare.
+# Reads ../.env for endpoints + keys. Pane IDs cached in /tmp/llm-compare-coder-panes.
+#
+# Usage:
+#   llm-compare-coder              # if panes exist: rerun; else start fresh
+#   llm-compare-coder start        # force-create new panes
+#   llm-compare-coder go ["p"]     # rerun
+#   llm-compare-coder reset        # forget pane IDs
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/../.env"
+set -a; . "$ENV_FILE"; set +a
+
+STATE_FILE=/tmp/llm-compare-coder-panes
+STREAM="${SCRIPT_DIR}/llm_stream.py"
+SPEC_FILE="${SPEC_FILE:-${SCRIPT_DIR}/specs/lfucache.py}"
+case "$SPEC_FILE" in
+  /*) ;;
+  *)  SPEC_FILE="$(cd "$(dirname "$SPEC_FILE")" && pwd)/$(basename "$SPEC_FILE")" ;;
+esac
+[[ -f "$SPEC_FILE" ]] || { echo "SPEC_FILE not found: $SPEC_FILE" >&2; exit 1; }
+
+SPEC_SRC="$(cat "$SPEC_FILE")"
+DEFAULT_PROMPT="Implement the Python class required by the canonical unittest spec below. Read the module docstring + test method names + assertions to understand the required API and semantics. Output ONLY the class implementation — DO NOT include any tests, do NOT add 'if __name__' main block, do NOT redefine anything from the spec. Your code will be concatenated above the spec and the spec will be executed.
+
+\`\`\`python
+${SPEC_SRC}
+\`\`\`
+
+CRITICAL: Every test in the spec MUST pass. Mentally walk through each test against your implementation before finalising. Handle every edge case the tests cover (capacity=0, ties, frequency bookkeeping, etc.). The score is N_passed / N_total — anything less than full is a failure."
+
+if [[ "${EXPAND:-0}" == "1" ]]; then
+  GUIDE_FILE=$("${SCRIPT_DIR}/expand_prompt.py" "$SPEC_FILE") || { echo "expand_prompt.py failed" >&2; exit 1; }
+  GUIDE_SRC="$(cat "$GUIDE_FILE")"
+  DEFAULT_PROMPT="${DEFAULT_PROMPT}
+
+--- IMPLEMENTATION GUIDE (senior engineer's notes; follow these) ---
+${GUIDE_SRC}
+--- END GUIDE ---"
+  echo "expanded with: $GUIDE_FILE"
+fi
+
+CLAUDE_MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
+IDC_HOST="${LLM_HOST:-idc-1}"
+IDC_PORT="${LLM_PORT:-8001}"
+IDC_MODEL="${LLM_MODEL_NAME:-qwen36}"
+PRO_HOST="${CODER_HOST:?CODER_HOST not set — run vast-coder refresh-ports}"
+PRO_PORT="${CODER_PORT:?CODER_PORT not set}"
+PRO_MODEL="${CODER_MODEL_NAME:-qwen36}"
+: "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY not set}"
+
+MAX_TOKENS="${MAX_TOKENS:-32768}"
+COUNTDOWN="${COUNTDOWN:-5}"
+RUNNER="${RUNNER:-${SCRIPT_DIR}/../.venv/bin/python3}"
+[[ -x "$RUNNER" ]] || RUNNER="python3"
+LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/../results.jsonl}"
+WALL_TIMEOUT="${WALL_TIMEOUT:-120}"
+
+CLAUDE_TEMPERATURE="${CLAUDE_TEMPERATURE:-${TEMPERATURE:-0}}"
+CLAUDE_TOP_P="${CLAUDE_TOP_P:-${TOP_P:-}}"
+# Qwen3.6 non-thinking per Unsloth guide
+QWEN_TEMPERATURE="${QWEN_TEMPERATURE:-0.7}"
+QWEN_TOP_P="${QWEN_TOP_P:-0.8}"
+QWEN_TOP_K="${QWEN_TOP_K:-20}"
+QWEN_MIN_P="${QWEN_MIN_P:-0}"
+QWEN_PRES_PENALTY="${QWEN_PRES_PENALTY:-1.5}"
+
+claude_sampling() {
+  local s="--temperature ${CLAUDE_TEMPERATURE} --wall-timeout ${WALL_TIMEOUT}"
+  [[ -n "$CLAUDE_TOP_P" ]] && s="${s} --top-p ${CLAUDE_TOP_P}"
+  echo "$s"
+}
+qwen_sampling() {
+  local s="--temperature ${QWEN_TEMPERATURE} --wall-timeout ${WALL_TIMEOUT}"
+  s="${s} --top-p ${QWEN_TOP_P} --top-k ${QWEN_TOP_K} --min-p ${QWEN_MIN_P} --presence-penalty ${QWEN_PRES_PENALTY}"
+  echo "$s"
+}
+CLAUDE_SAMPLING="$(claude_sampling)"
+QWEN_SAMPLING="$(qwen_sampling)"
+
+build_cmds() {
+  local p="$1"
+  local CLAUDE_SPEC="Anthropic API (hosted)"
+  local IDC_SPEC="2x RTX 3090, 48GB total, llama.cpp Qwen3.6-35B UD-Q4_K_XL MTP"
+  local PRO_SPEC="1x RTX PRO 5000 Blackwell, 48GB, llama.cpp Qwen3.6-35B UD-Q4_K_XL MTP"
+  CLAUDE_CMD="python3 '${STREAM}' --backend anthropic --label claude --url https://api.anthropic.com/v1 --model '${CLAUDE_MODEL}' --prompt-file '${p}' --api-key '${ANTHROPIC_API_KEY}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${CLAUDE_SPEC}' --spec-file '${SPEC_FILE}' --log-file '${LOG_FILE}' ${CLAUDE_SAMPLING}"
+  IDC_CMD="python3 '${STREAM}' --label 3090x2 --url http://${IDC_HOST}:${IDC_PORT}/v1 --model '${IDC_MODEL}' --prompt-file '${p}' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${IDC_SPEC}' --spec-file '${SPEC_FILE}' --log-file '${LOG_FILE}' ${QWEN_SAMPLING}"
+  PRO_CMD="python3 '${STREAM}' --label pro5000 --url http://${PRO_HOST}:${PRO_PORT}/v1 --model '${PRO_MODEL}' --prompt-file '${p}' --api-key 'EMPTY' --max-tokens ${MAX_TOKENS} --countdown ${COUNTDOWN} --run --runner '${RUNNER}' --spec '${PRO_SPEC}' --spec-file '${SPEC_FILE}' --log-file '${LOG_FILE}' ${QWEN_SAMPLING}"
+}
+
+write_prompt() {
+  local nonce p
+  p=$(mktemp -t llm_prompt.XXXXXX)
+  if [[ "${STABLE:-0}" == "1" ]]; then
+    printf '%s\n' "$1" > "$p"
+  else
+    nonce="$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')-$(date +%s%N)"
+    { printf '%s\n\n# nonce: %s\n' "$1" "$nonce"; } > "$p"
+  fi
+  echo "$p"
+}
+
+cmd_start() {
+  local prompt="$1" pfile
+  pfile=$(write_prompt "$prompt")
+  build_cmds "$pfile"
+  local ids
+  ids=$(/usr/bin/osascript <<APPLESCRIPT
+tell application "iTerm2"
+    tell current window
+        tell current session
+            set leftBottom to (split horizontally with default profile)
+        end tell
+        tell leftBottom
+            set midBottom to (split vertically with default profile)
+            write text "clear; ${CLAUDE_CMD//\"/\\\"}"
+            tell midBottom
+                set rightBottom to (split vertically with default profile)
+                write text "clear; ${IDC_CMD//\"/\\\"}"
+                tell rightBottom
+                    write text "clear; ${PRO_CMD//\"/\\\"}"
+                end tell
+            end tell
+        end tell
+        return (unique id of leftBottom) & "|" & (unique id of midBottom) & "|" & (unique id of rightBottom)
+    end tell
+end tell
+APPLESCRIPT
+)
+  echo "$ids" > "$STATE_FILE"
+  echo "panes started + cached → $STATE_FILE"
+  echo "prompt: $pfile"
+}
+
+cmd_go() {
+  local prompt="$1" pfile
+  [[ -s "$STATE_FILE" ]] || { echo "no cached panes; run: $0 start" >&2; exit 1; }
+  IFS='|' read -r CL_ID ID_ID PR_ID < "$STATE_FILE"
+  pfile=$(write_prompt "$prompt")
+  build_cmds "$pfile"
+  local matched
+  matched=$(/usr/bin/osascript <<APPLESCRIPT
+tell application "iTerm2"
+    set hitCount to 0
+    tell current window
+        repeat with t in tabs
+            repeat with s in sessions of t
+                if unique id of s is "${CL_ID}" then
+                    tell s to write text "clear; ${CLAUDE_CMD//\"/\\\"}"
+                    set hitCount to hitCount + 1
+                else if unique id of s is "${ID_ID}" then
+                    tell s to write text "clear; ${IDC_CMD//\"/\\\"}"
+                    set hitCount to hitCount + 1
+                else if unique id of s is "${PR_ID}" then
+                    tell s to write text "clear; ${PRO_CMD//\"/\\\"}"
+                    set hitCount to hitCount + 1
+                end if
+            end repeat
+            if hitCount is 3 then exit repeat
+        end repeat
+    end tell
+    return hitCount
+end tell
+APPLESCRIPT
+) || { echo "osascript failed" >&2; exit 1; }
+  if [[ "$matched" != "3" ]]; then
+    echo "panes lost (matched ${matched}/3) — clearing state, run: $0 start" >&2
+    rm -f "$STATE_FILE"
+    exit 1
+  fi
+  echo "go fired in cached panes | prompt: $pfile"
+}
+
+main() {
+  local sub="${1:-auto}"; shift || true
+  local prompt
+  case "$sub" in
+    start) prompt="${1:-$DEFAULT_PROMPT}"; cmd_start "$prompt" ;;
+    go)    prompt="${1:-$DEFAULT_PROMPT}"; cmd_go "$prompt" ;;
+    reset) rm -f "$STATE_FILE"; echo "state cleared" ;;
+    auto)  prompt="$DEFAULT_PROMPT"; [[ -s "$STATE_FILE" ]] && cmd_go "$prompt" || cmd_start "$prompt" ;;
+    -h|--help|help) sed -n '2,12p' "$0" ;;
+    *)     prompt="$sub"; [[ -s "$STATE_FILE" ]] && cmd_go "$prompt" || cmd_start "$prompt" ;;
+  esac
+}
+main "$@"

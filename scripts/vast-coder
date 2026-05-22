@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# Manage Vast.ai instance serving Qwen3-Coder-30B-A3B-Instruct Q5_K_M via llama.cpp.
+# Mirrors the 3090s/idc-1 setup (same model, same quant) on an RTX PRO 5000 Blackwell 48GB.
+# Reads .env keys: VAST_CODER_INSTANCE_ID, CODER_HOST, CODER_PORT, CODER_SSH_PORT, HF_TOKEN.
+#
+# Usage:
+#   vast-coder create        # rent + provision new instance
+#   vast-coder refresh-ports # re-read public IP/ports into .env
+#   vast-coder provision     # build llama.cpp, download GGUF, start server
+#   vast-coder start-server  # (re)start llama-server only
+#   vast-coder stop-server
+#   vast-coder status
+#   vast-coder logs [N]
+#   vast-coder follow
+#   vast-coder test
+#   vast-coder ssh [cmd...]
+#   vast-coder stop|start|destroy
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/../.env"
+[[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+set -a; . "$ENV_FILE"; set +a
+
+OFFER_ID="${VAST_CODER_OFFER_ID:-35820417}"
+IMAGE="${VAST_CODER_IMAGE:-nvidia/cuda:12.6.2-devel-ubuntu22.04}"
+DISK_GB="${VAST_CODER_DISK_GB:-60}"
+HF_REPO="${CODER_HF_REPO:-unsloth/Qwen3.6-35B-A3B-MTP-GGUF}"
+HF_FILE="${CODER_HF_FILE:-Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf}"
+SERVED_NAME="${CODER_MODEL_NAME:-qwen36}"
+CTX="${CODER_CTX:-65536}"
+MTP_N="${CODER_MTP_N:-2}"
+
+need() { command -v "$1" >/dev/null || { echo "need $1" >&2; exit 1; }; }
+need vastai; need jq; need ssh; need curl
+
+iid() { echo "${VAST_CODER_INSTANCE_ID:?VAST_CODER_INSTANCE_ID not set — run create or refresh-ports}"; }
+ssh_target() { echo "root@${CODER_HOST:?CODER_HOST not set}"; }
+ssh_args()   { echo "-o StrictHostKeyChecking=no -o ConnectTimeout=10 -p ${CODER_SSH_PORT:?CODER_SSH_PORT not set}"; }
+
+set_env() {
+  local k="$1" v="$2"
+  if grep -q "^${k}=" "$ENV_FILE"; then
+    sed -i.bak "s|^${k}=.*|${k}=${v}|" "$ENV_FILE" && rm -f "${ENV_FILE}.bak"
+  else
+    echo "${k}=${v}" >> "$ENV_FILE"
+  fi
+}
+
+cmd_create() {
+  local env_str ports
+  ports='-p 8000:8000 -p 22:22'
+  env_str="${ports} -e HF_TOKEN=${HF_TOKEN:?HF_TOKEN not set} -e LLAMA_CACHE=/workspace/models"
+  echo "creating instance from offer ${OFFER_ID}..."
+  vastai create instance "$OFFER_ID" --image "$IMAGE" --env "$env_str" \
+    --disk "$DISK_GB" --ssh --direct
+  echo "after a minute, run: $0 refresh-ports && $0 provision"
+}
+
+cmd_refresh_ports() {
+  local id raw ip p8000 p22
+  id=$(iid)
+  raw=$(vastai show instance "$id" --raw)
+  ip=$(echo "$raw" | jq -r '.public_ipaddr')
+  p8000=$(echo "$raw" | jq -r '.ports["8000/tcp"][0].HostPort')
+  p22=$(echo "$raw" | jq -r '.ports["22/tcp"][0].HostPort')
+  [[ "$ip" = "null" || -z "$ip" ]] && { echo "no public ip yet" >&2; exit 1; }
+  echo "CODER_HOST=$ip CODER_PORT=$p8000 CODER_SSH_PORT=$p22"
+  set_env CODER_HOST "$ip"
+  set_env CODER_PORT "$p8000"
+  set_env CODER_SSH_PORT "$p22"
+  echo "$ENV_FILE updated"
+}
+
+cmd_ssh() {
+  # shellcheck disable=SC2086
+  ssh $(ssh_args) "$(ssh_target)" "$@"
+}
+
+cmd_provision() {
+  cmd_ssh "
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y pciutils build-essential cmake curl git libcurl4-openssl-dev python3-pip tmux
+    pip install -q huggingface_hub
+    mkdir -p /workspace/models /var/log
+    cd /workspace
+    if [ ! -d llama.cpp ]; then
+      git clone --depth 1 https://github.com/ggml-org/llama.cpp
+    else
+      cd llama.cpp && git pull --ff-only && cd ..
+    fi
+    cmake llama.cpp -B llama.cpp/build -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON -DLLAMA_BUILD_UI=OFF
+    cmake --build llama.cpp/build --config Release -j --clean-first \
+      --target llama-cli llama-server llama-gguf-split
+    cp llama.cpp/build/bin/llama-* llama.cpp/
+    echo '=== llama.cpp built ==='
+    if [ ! -f /workspace/models/${HF_FILE} ]; then
+      hf download ${HF_REPO} ${HF_FILE} --local-dir /workspace/models
+    fi
+    ls -lh /workspace/models/${HF_FILE}
+  "
+  cmd_start_server
+}
+
+cmd_start_server() {
+  local model_file="/workspace/models/${HF_FILE}"
+  local launcher=/tmp/launch_coder_$$.sh
+  cat > "$launcher" <<EOF
+#!/usr/bin/env bash
+exec /workspace/llama.cpp/llama-server \\
+  -m ${model_file} \\
+  --host 0.0.0.0 --port 8000 \\
+  --alias ${SERVED_NAME} \\
+  -ngl 99 -c ${CTX} \\
+  --parallel 1 \\
+  --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 1.5 \\
+  --spec-type draft-mtp --spec-draft-n-max ${MTP_N} \\
+  --chat-template-kwargs '{"enable_thinking":false}' \\
+  --jinja
+EOF
+  chmod +x "$launcher"
+  # shellcheck disable=SC2086
+  scp -q $(ssh_args | sed 's/-p /-P /') "$launcher" "$(ssh_target):/workspace/launch.sh"
+  rm -f "$launcher"
+  cmd_ssh "tmux kill-session -t coder 2>/dev/null; pkill -f llama-server 2>/dev/null; sleep 1; mkdir -p /var/log; true"
+  cmd_ssh "tmux new-session -d -s coder 'bash /workspace/launch.sh > /var/log/llama.log 2>&1'"
+  sleep 3
+  cmd_ssh "tmux ls; pgrep -af /workspace/llama.cpp/llama-server | grep -v pgrep || echo NOT_RUNNING"
+}
+
+cmd_stop_server() { cmd_ssh "pkill -f llama-server || true; echo stopped"; }
+
+cmd_status() {
+  echo "=== endpoint ==="
+  curl -s -m 5 -o /tmp/coder_probe -w 'HTTP %{http_code} in %{time_total}s\n' \
+    "http://${CODER_HOST}:${CODER_PORT}/v1/models" || true
+  [[ -s /tmp/coder_probe ]] && jq . /tmp/coder_probe 2>/dev/null || true
+  echo
+  cmd_ssh '
+    echo === process ===
+    pgrep -af llama-server || echo "not running"
+    echo === gpu ===
+    nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader
+    echo === weights ===
+    du -sh /workspace/models 2>/dev/null
+  '
+}
+
+cmd_logs()   { cmd_ssh "tail -n ${1:-200} /var/log/llama.log"; }
+cmd_follow() { cmd_ssh "tail -F /var/log/llama.log"; }
+
+cmd_test() {
+  local url="http://${CODER_HOST}:${CODER_PORT}"
+  echo "=== /v1/models ==="
+  curl -fsS "$url/v1/models" | jq .
+  echo
+  echo "=== chat completion ==="
+  curl -fsS "$url/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg m "$SERVED_NAME" '{
+      model:$m, max_tokens:64, temperature:0,
+      messages:[{role:"user",content:"Reply with the single word PONG."}]
+    }')" | jq .
+}
+
+cmd_stop()    { vastai stop instance "$(iid)"; }
+cmd_start()   { vastai start instance "$(iid)"; echo "after a minute: $0 refresh-ports && $0 start-server"; }
+cmd_destroy() { vastai destroy instance "$(iid)"; }
+
+main() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    create)        cmd_create "$@" ;;
+    refresh-ports) cmd_refresh_ports ;;
+    provision)     cmd_provision ;;
+    start-server)  cmd_start_server ;;
+    stop-server)   cmd_stop_server ;;
+    status)        cmd_status ;;
+    logs)          cmd_logs "$@" ;;
+    follow)        cmd_follow ;;
+    test)          cmd_test ;;
+    ssh)           cmd_ssh "$@" ;;
+    stop)          cmd_stop ;;
+    start)         cmd_start ;;
+    destroy)       cmd_destroy ;;
+    -h|--help|help) sed -n '2,20p' "$0" ;;
+    *) echo "unknown: $sub" >&2; sed -n '2,20p' "$0"; exit 2 ;;
+  esac
+}
+main "$@"

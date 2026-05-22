@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Iterate every LiveCodeBench spec in scripts/specs/lcb/, fire 3-way,
+# wait for 3 new lines in the log, then move on. At the end, regenerate
+# RESULTS.md from the log.
+#
+# Usage: run-all-lcb [glob]    # default: scripts/specs/lcb/p*.py
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/../results.coder.jsonl}"
+export RESULTS_MD="${RESULTS_MD:-${SCRIPT_DIR}/../RESULTS.coder.md}"
+PATTERN="${1:-${SCRIPT_DIR}/specs/lcb/p*.py}"
+TIMEOUT_PER_SPEC="${TIMEOUT_PER_SPEC:-60}"   # seconds before we bail on this spec
+
+shopt -s nullglob
+files=( $PATTERN )
+[[ ${#files[@]} -gt 0 ]] || { echo "no specs matching $PATTERN" >&2; exit 1; }
+
+touch "$LOG_FILE"
+echo "Will run ${#files[@]} specs into $LOG_FILE, then write $RESULTS_MD"
+echo
+
+have_complete_task() {
+  # Returns 0 if $1 (task name) already has 3 distinct backend labels in LOG_FILE.
+  local task="$1"
+  python3 - "$task" "$LOG_FILE" <<'PY' 2>/dev/null
+import json, sys
+task, path = sys.argv[1], sys.argv[2]
+labels = set()
+try:
+    for line in open(path):
+        r = json.loads(line)
+        if r.get("task") == task:
+            labels.add(r.get("label"))
+except FileNotFoundError:
+    pass
+sys.exit(0 if len(labels) >= 3 else 1)
+PY
+}
+
+i=0
+for spec in "${files[@]}"; do
+  i=$((i + 1))
+  name=$(basename "$spec" .py)
+  if have_complete_task "$name"; then
+    printf '[%d/%d] %s ... SKIP (already complete)\n' "$i" "${#files[@]}" "$name"
+    continue
+  fi
+  before=$(wc -l < "$LOG_FILE" | tr -d ' ')
+  printf '[%d/%d] %s ... ' "$i" "${#files[@]}" "$name"
+  SPEC_FILE="$spec" "$SCRIPT_DIR/llm-compare-coder" go >/dev/null
+
+  # Wait for 3 new lines (one per pane). Bail after TIMEOUT_PER_SPEC seconds.
+  deadline=$(( $(date +%s) + TIMEOUT_PER_SPEC ))
+  target=$(( before + 3 ))
+  while :; do
+    now=$(wc -l < "$LOG_FILE" | tr -d ' ')
+    [[ $now -ge $target ]] && break
+    if [[ $(date +%s) -ge $deadline ]]; then
+      printf 'TIMEOUT (got %d/3 panes)\n' "$(( now - before ))"
+      break
+    fi
+    sleep 0.2
+  done
+  now=$(wc -l < "$LOG_FILE" | tr -d ' ')
+  printf 'logged %d lines\n' "$(( now - before ))"
+done
+
+echo
+echo "Regenerating $RESULTS_MD..."
+{
+  echo "# Results"
+  echo
+  echo "Generated $(date -u +%Y-%m-%dT%H:%M:%SZ) from $(basename "$LOG_FILE")."
+  echo
+  "$SCRIPT_DIR/summarize_results.py" "$LOG_FILE"
+} > "$RESULTS_MD"
+echo "wrote $RESULTS_MD ($(wc -l < "$RESULTS_MD") lines)"
